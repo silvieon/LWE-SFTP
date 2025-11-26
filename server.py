@@ -1,134 +1,285 @@
 import socket
-import threading 
-import time
-import MR
-from random import *
-from DH import *
-from struct import *
-from message import *
-from caesar_cipher import *
-from constants import *
-import hashlib
-from pathlib import Path
+import threading
 import os
+import random
+import json
+import sys
 
-def get_ip():
-    hostname = socket.gethostname()
-    return socket.gethostbyname(hostname)
+import numpy as np
 
-#password file dictionary on server
-pass_file = {}
+# Import constants and R-LWE functions
+from lwe_constants import N, Q
+from ftp_constants import FTP_PORT, SERVER_HOST, BUFFER_SIZE, SERVER_ROOT, USER_CREDENTIALS
 
-# function to check if input ID and Password already in the pass_file var  
-def check_creds(id, password):
-    global pass_file
-    password = password + str(pass_file[id]['salt']) + str(pass_file[id]['prime'])
-    password = hashlib.sha1(password.encode()).hexdigest()
-    if pass_file[id]['password'] == password:
-        return 1;
-    return -1;
+from r_lwe import KeyGen, HelpRec, Rec
+from poly_ops import PO # Get the pre-instantiated PolyOps object
 
-# thread fuction for each client connnected
-def threaded(conn, addr): 
-    s_addr = get_ip()
-    d_addr = addr[0]
+if not os.path.exists(SERVER_ROOT):
+    os.makedirs(SERVER_ROOT)
 
-    # receiving DH public (Ya, prime, alpha) from A
-    DH_share_pack = conn.recv(calcsize('iii'))
-    DH_data = unpack_DH_share_pack(DH_share_pack)
-    print("Received from Client", DH_data)
+class FTP_Session:
+    """Manages a single client session with R-LWE state."""
+    def __init__(self, conn, addr):
+        self.conn = conn
+        self.addr = addr
+        self.authenticated = False
+        self.current_user = None
+        self.cwd = os.path.abspath(SERVER_ROOT)
+        self.data_socket = None
+        self.shared_key = None 
+        self.key_exchange_complete = False
 
-    # computing Yb from alpha and prime received from client 'A'
-    Xb = randrange(2, DH_data['prime'] - 2) # private to server 'B'
-    Yb = pow(DH_data['alpha'], Xb, DH_data['prime']) # public to client 'A'
+    def send_response(self, code, message):
+        """Sends an FTP response back to the client."""
+        response = f"{code} {message}\r\n"
+        sys.stdout.write(f"-> {self.addr[0]}:{self.addr[1]} | {response}")
+        try:
+            self.conn.sendall(response.encode('utf-8'))
+        except socket.error:
+            self.conn.close()
 
-    # sharing Yb with client 'A'
-    DH_reshare_pack = create_DH_reshare_pack(Yb)
-    conn.sendall(DH_reshare_pack)
+    # Communication helpers for R-LWE (JSON serialization of polynomials)
+    def send_json(self, data):
+        """Sends structured data (polys) over the control channel."""
+        try:
+            json_data = json.dumps(data)
+            self.conn.sendall(json_data.encode('utf-8') + b'\r\n')
+        except socket.error as e:
+            print(f"[ERROR] Failed to send JSON: {e}")
+            self.conn.close()
 
-    prime = DH_data['prime']
-    key = pow(DH_data['Ya'], Xb , prime) #computing the shared key with client
+    def recv_json(self):
+        """Receives structured data (polys) from the control channel."""
+        data = b''
+        while True:
+            try:
+                chunk = self.conn.recv(1)
+                if chunk == b'\n': break
+                if chunk != b'\r': data += chunk
+            except socket.error: return None # Connection closed
+        
+        try:
+            return json.loads(data.decode('utf-8'))
+        except json.JSONDecodeError:
+            print(f"[ERROR] JSON decoding failed.")
+            return None
 
-    print("key is " + str(key))
-    print("prime is " + str(prime))
-    print("Done Diffie-Hellmann!!\n")
+    def start_data_connection(self):
+        """Establishes the data connection socket (passive mode)."""
+        if not self.data_socket:
+            self.send_response(425, "No data connection established (use PASV).")
+            return None
+        
+        try:
+            data_conn, data_addr = self.data_socket.accept()
+            print(f"[DATA CONNECTED] Client {data_addr[0]}:{data_addr[1]} for transfer.")
+            return data_conn
+        except socket.error as e:
+            print(f"[ERROR] Failed to accept data connection: {e}")
+            return None
+        finally:
+            if self.data_socket:
+                 self.data_socket.close()
+                 self.data_socket = None
 
-    while True:
-        msg = conn.recv(calcsize('iqq10s10si10si80si'))
-        msg = unpack_message(msg)
-        print("Received from client: ", msg)
+    def xor_data(self, data_bytes):
+        """Performs XOR encryption/decryption using the repeating R-LWE key (K)."""
+        if self.shared_key is None: raise ValueError("Shared key not established.")
 
-        if msg['opcode'] == LOGINCREAT:
-            ID = decrypt(msg['ID'], key)
-            password = decrypt(msg['password'], key)
-            print(ID, password)
-            # add to table
-            salt = abs(getrandbits(6)) #getting a random salt
-            password = password + str(salt) + str(prime)
-            password = hashlib.sha1(password.encode()).hexdigest() #using sha-1 hash function
+        key_stream = np.array(self.shared_key, dtype=np.uint8)
+        key_len = len(key_stream)
+        
+        encrypted_bytes = bytearray(len(data_bytes))
+        
+        for i in range(len(data_bytes)):
+            key_byte = key_stream[i % key_len]
+            encrypted_bytes[i] = data_bytes[i] ^ key_byte
+            
+        return bytes(encrypted_bytes)
 
-            if ID in pass_file.keys():
-                msg = create_message(s_addr=s_addr,d_addr=d_addr, opcode = LOGINREPLY, status = 0)
-                print("Sent LOGINREPLY Message", unpack_message(msg))
-                conn.sendall(msg)
-            else:
-                pass_file[ID] = {'password' : password, 'prime' : prime, 'salt' : salt}
-                print(pass_file)
-                msg = create_message(s_addr=s_addr,d_addr=d_addr, opcode = LOGINREPLY, status = 1)
-                print("Sent LOGINREPLY Message", unpack_message(msg))
-                conn.sendall(msg) 
+    # --- R-LWE Key Exchange Handler ---
 
-        elif msg['opcode'] == AUTHREQUEST:            
-            ID = decrypt(msg['ID'], key)
-            password = decrypt(msg['password'], key)
-            print(ID, password)
-            #check in table
-            if ID not in pass_file.keys():
-                msg = create_message(s_addr=s_addr,d_addr=d_addr, opcode = AUTHREPLY, status = 0)
-                print("Sent AUTHREPLY Message", unpack_message(msg))
-                conn.sendall(msg) 
-            else:
-                status = check_creds(ID, password)
-                msg = create_message(s_addr=s_addr,d_addr=d_addr, opcode = AUTHREPLY, status = status)
-                print("Sent AUTHREPLY Message", unpack_message(msg))
-                conn.sendall(msg) 
+    def handle_key_exchange(self):
+        """Executes the R-LWE key exchange protocol."""
+        self.send_response(220, "Initiating R-LWE Key Exchange.")
 
-        elif msg['opcode'] == SERVICEREQUEST:            
-            ID = decrypt(msg['ID'], key)
-            file = msg['file']
-            filename = Path(file).name
-            print(ID, file)
+        try:
+            # 1. Server generates Public A and its secret keys
+            A = PO.sample_A()
+            s_B, B_B = KeyGen(A)
 
-            if not os.path.isfile(file):            
-                msg = create_message(s_addr=s_addr,d_addr=d_addr, opcode = SERVICEDONE,  status = -1)
-                print("Sent SERVICEDONE Message", unpack_message(msg))
-                conn.sendall(msg)   
-            else:
-                f = open(file)
-                print("Transferring file to client!!")
-                while True:
-                    c = f.read(10) # 10 bits of file at a time to client
-                    if not c:
-                        break
-                    msg = create_message(s_addr=s_addr,d_addr=d_addr, opcode = SERVICEDONE, file = filename, buf = c, status = 0)
-                    conn.sendall(msg)
-                msg = create_message(s_addr=s_addr,d_addr=d_addr, opcode = SERVICEDONE, file = filename, status = 1)
-                conn.sendall(msg)
-                print("Done Transferring File to client!!!")
+            # 2. Send A to Client
+            self.send_response(225, "Sending A.")
+            self.send_json(A.tolist())
+            
+            # 3. Receive Client's Public Key B_A
+            client_B_A_list = self.recv_json()
+            if client_B_A_list is None: raise Exception("Did not receive B_A.")
+            B_A = np.array(client_B_A_list, dtype=int)
+            self.send_response(226, "Received B_A. Sending B_B.")
 
+            # 4. Send Server's Public Key B_B
+            self.send_json(B_B.tolist())
+            
+            # 5. Receive Client's Hint h
+            client_h_list = self.recv_json()
+            if client_h_list is None: raise Exception("Did not receive hint h.")
+            h = np.array(client_h_list, dtype=int)
+            self.send_response(227, "Received hint h.")
 
+            # 6. Server computes Shared Secret K
+            raw_w_B = PO.poly_mul(B_A, s_B)
+            K_B = Rec(raw_w_B, h)
+            
+            self.shared_key = K_B
+            self.key_exchange_complete = True
+            
+            self.send_response(230, "Key Exchange successful. Ready for USER/PASS.")
+            print(f"[KEY SUCCESS] Shared Key K established.")
+            
+        except Exception as e:
+            print(f"[KEY EXCHANGE FAILED] {e}")
+            self.send_response(500, "Key Exchange Failed. Disconnecting.")
+            self.conn.close()
+            return
 
-    conn.close() 
+    # --- Command Handlers (omitted for brevity, assume they call xor_data correctly) ---
+    def check_auth_and_key(self):
+        if not self.key_exchange_complete:
+            self.send_response(503, "Key Exchange required before authentication.")
+            return False
+        if not self.authenticated:
+            self.send_response(530, "Not logged in.")
+            return False
+        return True
 
-HOST = '127.0.0.1'  # Standard loopback interface address (localhost)
-PORT = 65432        # Port to listen on (non-privileged ports are > 1023)
+    def handle_user(self, username):
+        if not self.key_exchange_complete: self.send_response(503, "Key Exchange must complete first."); return
+        if username in USER_CREDENTIALS: self.current_user = username; self.send_response(331, "Username okay, need password.")
+        else: self.send_response(530, "Not logged in. Invalid username.")
 
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.bind((HOST, PORT))
-s.listen()
-while True: 
-    conn, addr = s.accept()
-    print('Connected by', addr)
-    t = threading.Thread(target=threaded, args=(conn,addr,))
-    t.start() 
-s.close() 
+    def handle_pass(self, password):
+        if self.current_user and USER_CREDENTIALS.get(self.current_user) == password:
+            self.authenticated = True; self.send_response(230, "User logged in, proceed."); print(f"[AUTH SUCCESS] User: {self.current_user}")
+        else: self.send_response(530, "Not logged in. Incorrect password."); self.current_user = None
+
+    def handle_pasv(self):
+        if not self.check_auth_and_key(): return
+        if self.data_socket: self.data_socket.close()
+        self.data_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.data_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        port = random.randint(49152, 65535)
+        self.data_socket.bind((SERVER_HOST, port)); self.data_socket.listen(1)
+        ip_parts = SERVER_HOST.split('.'); p1 = port // 256; p2 = port % 256
+        data_info = f"{ip_parts[0]},{ip_parts[1]},{ip_parts[2]},{ip_parts[3]},{p1},{p2}"
+        self.send_response(227, f"Entering Passive Mode ({data_info})"); print(f"[PASV] Opened data port {port}")
+
+    def handle_list(self):
+        if not self.check_auth_and_key(): return
+        full_path = self.cwd
+        if not os.path.isdir(full_path): self.send_response(550, "CWD is not a directory."); return
+        self.send_response(150, "Opening ENCRYPTED data connection for file list.")
+        data_conn = self.start_data_connection()
+        if data_conn:
+            try:
+                files = os.listdir(full_path); listing = ""
+                for item in files:
+                    item_path = os.path.join(full_path, item); size = os.path.getsize(item_path)
+                    type_char = 'd' if os.path.isdir(item_path) else '-'; listing += f"{type_char}rw-rw-r-- 1 ftp ftp {size:>10} Jan 01 00:00 {item}\r\n"
+                encrypted_listing = self.xor_data(listing.encode('utf-8')); data_conn.sendall(encrypted_listing)
+                self.send_response(226, "Encrypted Directory send successful.")
+            except Exception as e: self.send_response(550, f"Failed to list directory: {e}")
+            finally: data_conn.close()
+
+    def handle_retr(self, filename):
+        if not self.check_auth_and_key(): return
+        full_path = os.path.join(self.cwd, filename)
+        if not os.path.exists(full_path) or os.path.isdir(full_path): self.send_response(550, "File not found or is a directory."); return
+        self.send_response(150, f"Opening ENCRYPTED data connection for {filename}.")
+        data_conn = self.start_data_connection()
+        if data_conn:
+            try:
+                with open(full_path, 'rb') as f:
+                    while True:
+                        data = f.read(BUFFER_SIZE);
+                        if not data: break
+                        encrypted_data = self.xor_data(data); data_conn.sendall(encrypted_data)
+                self.send_response(226, "Encrypted Transfer complete.")
+            except Exception as e: self.send_response(550, f"Failed to retrieve file: {e}")
+            finally: data_conn.close()
+
+    def handle_stor(self, filename):
+        if not self.check_auth_and_key(): return
+        full_path = os.path.join(self.cwd, filename)
+        self.send_response(150, f"Opening ENCRYPTED data connection for {filename}.")
+        data_conn = self.start_data_connection()
+        if data_conn:
+            temp_path = full_path + ".tmp"
+            try:
+                with open(temp_path, 'wb') as f:
+                    while True:
+                        encrypted_data = data_conn.recv(BUFFER_SIZE)
+                        if not encrypted_data: break
+                        decrypted_data = self.xor_data(encrypted_data)
+                        f.write(decrypted_data)
+                os.rename(temp_path, full_path); self.send_response(226, "Encrypted Transfer complete.")
+            except Exception as e: self.send_response(550, f"Failed to store file: {e}"); 
+            finally: data_conn.close()
+
+    def handle_quit(self):
+        self.send_response(221, "Goodbye."); self.conn.close(); return True
+
+    def handle_command(self, command_line):
+        parts = command_line.strip().split(); command = parts[0].upper(); arg = parts[1] if len(parts) > 1 else ""
+        if command == 'USER': self.handle_user(arg)
+        elif command == 'PASS': self.handle_pass(arg)
+        elif command == 'PASV': self.handle_pasv()
+        elif command == 'LIST': self.handle_list()
+        elif command == 'RETR': self.handle_retr(arg)
+        elif command == 'STOR': self.handle_stor(arg)
+        elif command == 'QUIT': return self.handle_quit()
+        else: self.send_response(502, f"Command {command} not implemented.")
+        return False
+
+    def run(self):
+        self.handle_key_exchange()
+        if not self.key_exchange_complete: return
+
+        try:
+            while True:
+                data = self.conn.recv(BUFFER_SIZE).decode('utf-8')
+                if not data: break
+                commands = data.split('\r\n')
+                for command_line in commands:
+                    if command_line and self.handle_command(command_line): return
+        except ConnectionResetError:
+            print(f"[ERROR] Client {self.addr} forcefully disconnected.")
+        finally:
+            self.conn.close()
+
+def start_server():
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    
+    # Ensure server root exists
+    if not os.path.exists(SERVER_ROOT):
+        os.makedirs(SERVER_ROOT)
+
+    try:
+        server_socket.bind((SERVER_HOST, FTP_PORT))
+        server_socket.listen(5)
+        print(f"[*] Secure FTP Server listening on {SERVER_HOST}:{FTP_PORT}")
+
+        while True:
+            conn, addr = server_socket.accept()
+            print(f"[NEW CONNECTION] Connected to {addr[0]}:{addr[1]}")
+            client_thread = threading.Thread(target=FTP_Session(conn, addr).run)
+            client_thread.start()
+
+    except Exception as e:
+        print(f"[FATAL ERROR] Server crashed: {e}")
+    finally:
+        server_socket.close()
+
+if __name__ == '__main__':
+    start_server()
