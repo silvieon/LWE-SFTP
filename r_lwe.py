@@ -3,23 +3,23 @@ from poly_ops import PO # Get the pre-instantiated PolyOps object
 from lwe_constants import N, Q, K_ERROR, a
 
 def KeyGen(A):
-    """
-    Alice or Bob's Key Generation.
-    A is the public polynomial (shared).
-    Returns (s, P), where s is the secret key and P is the public key (b = a*s + e).
-    """
+
+    # Alice or Bob's Key Generation.
+    # A is the public polynomial (shared).
+    # Returns (s, P), where s is the secret key and P is the public key (b = a*s + e).
+
     s = PO.sample_small(k=K_ERROR)
     e = PO.sample_small(k=K_ERROR)
     a_times_s = PO.poly_mul(A, s)
-    b = PO.reduce_mod_q(a_times_s + e)
+    b = PO.reduce_mod_q(a_times_s + 2 * e)
     return s, b # P is b
 
 def HelpRec(v):
-    """
-    Alice's Reconciliation Hint Generator (HelpRec).
-    Input: v = raw shared secret (v = B_B * s_A + e_A_prime).
-    Output: h (The hint/correction factor, polynomial of 0s and 1s).
-    """
+
+    # Alice's Reconciliation Hint Generator (HelpRec).
+    # Input: v = raw shared secret (v = B_B * s_A + e_A_prime).
+    # Output: h (The hint/correction factor, polynomial of 0s and 1s).
+
     h = np.zeros(N, dtype=int)
     for i in range(N):
         v_i = v[i] % Q
@@ -33,12 +33,12 @@ def HelpRec(v):
     return h
 
 def Rec(w, h):
-    """
-    Bob's Shared Secret Recovery (Rec).
-    Input: w = raw shared secret (w = B_A * s_B + e_B_prime).
-           h = Alice's reconciliation hint.
-    Output: K (The final shared key, a polynomial of 0s and 1s).
-    """
+
+    # Bob's Shared Secret Recovery (Rec).
+    # Input: w = raw shared secret K_A, K_B.
+    #        h = Alice's reconciliation hint.
+    # Output: K (The final shared key, a polynomial of 0s and 1s).
+
     K = np.zeros(N, dtype=int)
     
     for i in range(N):

@@ -132,48 +132,56 @@ class FTPClient:
         print("[*] Initiating R-LWE Key Exchange...")
         
         try:
-            # 1. Receive Server's initial 225 response (Contains A_params)
+            # 1. Receive Server's initial 225 response (Contains m)
             response = self._receive_response()
-            if not response or not response.startswith('225'): raise Exception("Did not receive A_params hint.")
-            
-            # 2. Receive A from Server
-            server_A_list = self._recv_json()
-            if server_A_list is None: raise Exception("Did not receive A.")
-            A = np.array(server_A_list, dtype=int)
-            
-            # 3. Client KeyGen
-            s_A, B_A = KeyGen(A)
+            if not response or not response.startswith('225'): raise Exception("Did not receive m response.")
 
-            # 4. Send Client's Public Key B_A
-            self._send_command("B_A SENT") # Placeholder command for logging
-            self._send_json(B_A.tolist())
-            response = self._receive_response()
-            if not response or not response.startswith('226'): raise Exception("Did not receive B_B hint.")
-            
-            # 5. Receive Server's Public Key B_B
-            server_B_B_list = self._recv_json()
-            if server_B_B_list is None: raise Exception("Did not receive B_B.")
-            B_B = np.array(server_B_B_list, dtype=int)
-            
-            # 6. Calculate raw secret v_A and generate hint h
-            raw_v_A = PO.poly_mul(B_B, s_A)
-            h = HelpRec(raw_v_A)
+            # 2. Receive m from server
+            server_m_list = self._recv_json()
+            if server_m_list is None: raise Exception("Did not receive m.")
+            m = np.array(server_m_list, dtype=int)
 
-            # 7. Send Client's Hint h
-            self._send_command("H SENT") # Placeholder command for logging
-            self._send_json(h.tolist())
+            # 2a.Confirm with re-send of m back to server
+            self._send_command(220, "Received public m. Confirming with re-send.")
+            self._send_json(server_m_list)
+
             response = self._receive_response()
-            if not response or not response.startswith('227'): raise Exception("Did not receive final K hint.")
+            if not response or not response.startswith('226'): raise Exception("Did not receive P_A response.")
+
+            server_P_A_list = self._recv_json()
+            if server_P_A_list is None: raise Exception("Did not receive P_A.")
+            P_A = np.array(server_P_A_list, dtype=int)
+
+            # 3. Server generates intermediary shared key K_B and secret key s_B
+            s_B, K_B = KeyGen(P_A)
+
+            # 4. Calculate intermediary public key P_B
+            msB = PO.poly_mul(m, s_B)
+            e   = PO.sample_small(k=K_ERROR)
+            mse = msB + 2 * e
+            P_B = PO.reduce_mod_q(mse)
+
+            # 5. Send intermediary public key P_B to server
+            self._send_command("Intermediary shared key P_B SENT")
+            self._send_json(P_B.tolist())
+            response = self._receive_response()
+            if not response or not response.startswith('227'): raise Exception("Did not receive reclamation hint response.")
             
-            # 8. Client computes Shared Secret K
-            K_A = Rec(raw_v_A, h)
-            self.shared_key = K_A
+            # 5. Receive server's reclamation hint
+            server_h_list = self._recv_json()
+            if server_h_list is None: raise Exception("Did not receive reclamation hint.")
+            h = np.array(server_h_list, dtype=int)
+            
+            # 6. Calculate shared key SK_B
+            SK_B = Rec(K_B, h)
+
+            self.shared_key = SK_B
             
             # 9. Final 230 response
             response = self._receive_response()
             if not response or not response.startswith('230'): raise Exception("Server key finalization failed.")
 
-            print(f"[KEY SUCCESS] Shared Key K established (First 8 bits: {K_A[:8]})")
+            print(f"[KEY SUCCESS] Shared Key K established (First 8 bits: {SK_B[:8]})")
             return True
         
         except Exception as e:

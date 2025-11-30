@@ -8,7 +8,7 @@ import sys
 import numpy as np
 
 # Import constants and R-LWE functions
-from lwe_constants import N, Q
+from lwe_constants import N, Q, K_ERROR
 from ftp_constants import FTP_PORT, SERVER_HOST, BUFFER_SIZE, SERVER_ROOT, USER_CREDENTIALS
 
 from r_lwe import KeyGen, HelpRec, Rec
@@ -104,34 +104,46 @@ class FTP_Session:
         self.send_response(220, "Initiating R-LWE Key Exchange.")
 
         try:
-            # 1. Server generates Public A and its secret keys
-            A = PO.sample_A()
-            s_B, B_B = KeyGen(A)
+            # 1. Server samples m and sends it to server
+            m = PO.sample_A()
 
-            # 2. Send A to Client
-            self.send_response(225, "Sending A.")
-            self.send_json(A.tolist())
-            
-            # 3. Receive Client's Public Key B_A
-            client_B_A_list = self.recv_json()
-            if client_B_A_list is None: raise Exception("Did not receive B_A.")
-            B_A = np.array(client_B_A_list, dtype=int)
-            self.send_response(226, "Received B_A. Sending B_B.")
+            # 2. Server generates public key P_A and secret key s_A
+            s_A, P_A = KeyGen(m)
 
-            # 4. Send Server's Public Key B_B
-            self.send_json(B_B.tolist())
-            
-            # 5. Receive Client's Hint h
-            client_h_list = self.recv_json()
-            if client_h_list is None: raise Exception("Did not receive hint h.")
-            h = np.array(client_h_list, dtype=int)
-            self.send_response(227, "Received hint h.")
+            # 2. Send m to client
+            self.send_response(225, "Sending public m")
+            self.send_json(m.tolist())
 
-            # 6. Server computes Shared Secret K
-            raw_w_B = PO.poly_mul(B_A, s_B)
-            K_B = Rec(raw_w_B, h)
+            # 2a.Confirm client m same as sent m
+
+            client_m_list = self.recv_json()
+            m_confirm = np.array(client_m_list, dtype=int)
+            if m_confirm is None: raise Exception("Did not receive m confirmation.")
+            if m_confirm != m: raise Exception("m confirmation different from m.")
+
+            # 3. Send public key P_A to client
+            self.send_response(226, "m public confirmed. Sending public key P_A to client.")
+            self.send_json(P_A.tolist())
             
-            self.shared_key = K_B
+            # 4. Receive intermediary public key P_B
+            client_P_B_list = self.recv_json()
+            if client_P_B_list is None: raise Exception("Did not receive B_A.")
+            P_B = np.array(client_P_B_list, dtype=int)
+
+            # 5. Calculate intermediary shared key K_A
+            spB = PO.poly_mul(s_A, P_B)
+            e   = PO.sample_small(k=K_ERROR)
+            spe = spB + 2 * e
+            K_A = PO.reduce_mod_q(spe)
+
+            self.send_response(227, "Received P_B. Sending reclamation hint.")
+            h = PO.sample_binary()
+            self.send_json(h.to_list())
+            
+            # 6. Calculate shared key SK_A
+            SK_A = Rec(K_A, h)
+            
+            self.shared_key = SK_A
             self.key_exchange_complete = True
             
             self.send_response(230, "Key Exchange successful. Ready for USER/PASS.")
