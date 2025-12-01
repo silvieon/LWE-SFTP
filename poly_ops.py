@@ -12,7 +12,7 @@ class PolyOps:
         self.Q = Q
 
     def reduce_mod_q(self, p):
-        """Reduces all coefficients of a polynomial modulo Q."""
+        # Reduces all coefficients of a polynomial modulo Q.
         return p % self.Q
 
     def poly_mul(self, p1, p2):
@@ -34,7 +34,7 @@ class PolyOps:
         # 3. Reduction modulo Q
         return self.reduce_mod_q(p_reduced).astype(int)
 
-    def sample_A(self):
+    def sample_m(self):
         """Generates a public polynomial A with uniform random coefficients in Z_Q."""
         return np.random.randint(0, self.Q, size=self.N, dtype=int)
 
@@ -48,6 +48,16 @@ class PolyOps:
             b1 = np.random.randint(0, 2, size=k)
             b2 = np.random.randint(0, 2, size=k)
             p[i] = np.sum(b1) - np.sum(b2)
+        return p
+    
+    def sample_binary(self):
+        """
+        Samples a 'small' polynomial (secret key s or error e) from a centered 
+        binomial distribution approximation (CBD).
+        """
+        p = np.zeros(self.N, dtype=int)
+        for i in range(self.N):
+            p[i] = np.random.randint(0, 1)
         return p
 
 # Instantiate the PolyOps helper for use in r-lwe.py
