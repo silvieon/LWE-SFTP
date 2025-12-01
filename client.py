@@ -142,7 +142,7 @@ class FTPClient:
             m = np.array(server_m_list, dtype=int)
 
             # 2a.Confirm with re-send of m back to server
-            self._send_command(220, "Received public m. Confirming with re-send.")
+            self._send_command("Received public m. Confirming with re-send.")
             self._send_json(server_m_list)
 
             response = self._receive_response()
