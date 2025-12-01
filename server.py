@@ -116,7 +116,7 @@ class FTP_Session:
 
             # 2a.Confirm client m same as sent m
 
-            client_m_list = self.recv_json()
+            client_m_list = self._recv_json()
             m_confirm = np.array(client_m_list, dtype=int)
             if m_confirm is None: raise Exception("Did not receive m confirmation.")
             if m_confirm != m: raise Exception("m confirmation different from m.")
