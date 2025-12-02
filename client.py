@@ -142,7 +142,7 @@ class FTPClient:
             m = np.array(server_m_list, dtype=int)
 
             # 2a.Confirm with re-send of m back to server
-            self._send_command("Received public m. Confirming with re-send.")
+            print("Received public m. Confirming with re-send.")
             self._send_json(server_m_list)
 
             response = self._receive_response()
@@ -162,7 +162,7 @@ class FTPClient:
             P_B = PO.reduce_mod_q(mse)
 
             # 5. Send intermediary public key P_B to server
-            self._send_command("Intermediary shared key P_B SENT")
+            print("Intermediary shared key P_B SENT")
             self._send_json(P_B.tolist())
             response = self._receive_response()
             if not response or not response.startswith('227'): raise Exception("Did not receive reclamation hint response.")

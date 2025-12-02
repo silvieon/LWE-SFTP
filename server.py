@@ -105,7 +105,7 @@ class FTP_Session:
 
         try:
             # 1. Server samples m and sends it to server
-            m = PO.sample_A()
+            m = PO.sample_m()
 
             # 2. Server generates public key P_A and secret key s_A
             s_A, P_A = KeyGen(m)
@@ -120,7 +120,11 @@ class FTP_Session:
             if client_m_list is None: raise Exception("Did not receive confirmation m.")
             m_confirm = np.array(client_m_list, dtype=int)
             if m_confirm is None: raise Exception("Did not receive m confirmation.")
-            if m_confirm != m: raise Exception("m confirmation different from m.")
+            if m_confirm.any() != m.any(): raise Exception("m confirmation different from m.")
+
+            print("" \
+            "public m sharing done." \
+            "")
 
             # 3. Send public key P_A to client
             self.send_response(226, "m public confirmed. Sending public key P_A to client.")
@@ -139,7 +143,7 @@ class FTP_Session:
 
             self.send_response(227, "Received P_B. Sending reclamation hint.")
             h = PO.sample_binary()
-            self.send_json(h.to_list())
+            self.send_json(h.tolist())
             
             # 6. Calculate shared key SK_A
             SK_A = Rec(K_A, h)
