@@ -128,7 +128,7 @@ class FTPClient:
     # --- R-LWE Key Exchange Handler ---
 
     def _handle_key_exchange(self):
-        """Executes the R-LWE key exchange protocol (Client is the initiator of A)."""
+        """Executes the R-LWE key exchange protocol (Client is the initiator of SYSTEM)."""
         print("[*] Initiating R-LWE Key Exchange...")
         
         try:

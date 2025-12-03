@@ -1,0 +1,171 @@
+silvieon's SECURE FTP (S-FTP) SYSTEM README
+
+This is a toy implementation of a File Transfer Protocol (FTP) client and server se-
+cured using the Ring Learning With Errors (R-LWE) lattice-based cryptographic scheme 
+for key exchange and XOR encryption for data transfer.
+
+The system uses standard Python sockets and NumPy for polynomial mathematics, imple-
+menting a secure, post-quantum-ready network protocol.
+
+=======================================================
+
+SYSTEM ARCHITECTURE
+=======================================================
+
+The system is split into two primary components:
+
+Server (server.py) listens for connections, performs R-LWE key exchange, handles FTP 
+control commands (USER, PASS, PASV, LIST, RETR, STOR), and encrypts/decrypts data 
+transfers.
+
+Client (client.py) connects to the server, initiates R-LWE key exchange, performs 
+reconciliation to derive the shared secret, and handles command input, encrypting 
+data before upload and decrypting data after download/listing.
+
+Security Layer:
+
+Key Exchange: R-LWE (Ding Xie Lin 2012) is used to establish a shared, secret key K 
+that is resilient against quantum computer attacks.
+
+Data Encryption: Once the key (K) is established, all subsequent data (directory li-
+stings, file contents) is secured using a simple stream cipher (XOR) with the repea-
+ting shared key K.
+
+======================================================= 2. SETUP AND PREREQUISITES
+
+This system requires the NumPy library for polynomial arithmetic.
+
+Install NumPy:
+
+pip install numpy
+
+
+Directory Structure:
+Ensure all Python files are in the same directory. The server will automatically create a folder named secure_ftp_root transferred file storage.
+
+Files Required:
+
+lwe_constants.py
+
+ftp_constants.py
+
+poly_ops.py
+
+r_lwe.py
+
+server.py
+
+client.py
+
+======================================================= 3. USAGE INSTRUCTIONS
+
+Step 3.1: Start the Server
+
+Run the server in a dedicated terminal window. It will listen on the address and 
+port specified in ftp_constants.py (default: 127.0.0.1:21).
+
+python server.py
+
+OR
+
+python3 server.py
+
+
+Expected Output:
+[*] Secure FTP Server listening on 127.0.0.1:21
+
+Step 3.2: Start the Client and Key Exchange
+
+Run the client in a separate terminal window. It will immediately attempt to connect 
+and initiate the R-LWE key exchange.
+
+python client.py
+
+OR
+
+python3 client.py
+
+
+Expected Output (if successful):
+
+[*] Connected to server at 127.0.0.1:21
+[SERVER]: 220 Initiating R-LWE Key Exchange.
+... R-LWE steps ...
+[KEY SUCCESS] Shared Key K established (First 8 bits: [...])
+[SERVER]: 230 Key Exchange successful. Ready for USER/PASS.
+S-FTP> 
+
+
+Step 3.3: Authenticate
+
+Use the predefined credentials. The default credentials are:
+
+Username: testuser
+
+Password: password123
+
+S-FTP> USER testuser
+[SERVER]: 331 Username okay, need password.
+S-FTP> PASS password123
+[SERVER]: 230 User logged in, proceed.
+
+
+Step 3.4: File Operations
+
+You can now use the following commands to perform secure data transfers. All data is 
+automatically encrypted/decrypted using the shared R-LWE key (K).
+
+Here is a list of implemented commands.
+
+LIST
+
+    View the contents of the server's current directory.
+
+    The raw listing is encrypted over the data channel, then decrypted by the client 
+    before printing.
+
+STOR <local_file_path>
+
+    Upload a local file.
+
+    The client reads the local file, encrypts the data chunk-by-chunk, and sends the 
+    encrypted stream to the server.
+
+RETR <remote_file_name>
+
+    Download a file from the server.
+
+    The server reads the file, encrypts the data, and sends the encrypted stream. 
+    The client receives and decrypts it locally.
+
+EXIT or QUIT
+
+    Close the connection.
+
+    Ends the client session gracefully.
+
+Example Upload (STOR):
+
+S-FTP> STOR local_document.pdf
+[*] Reading and encrypting file: local_document.pdf...
+[*] Successfully encrypted and uploaded file: local_document.pdf
+[SERVER]: 226 Encrypted Transfer complete.
+
+
+======================================================= 4. MISC INFORMATION
+
+The security of the system relies on the complexity of polynomial arithmetic in the 
+ring $R_q = Z_q[x] / (x^N + 1)$ (R-LWE assumption).
+
+ftp_constants.py: Defines the key parameters for the FTP system.
+
+lwe_constants.py: Defines the key parameters for the R-LWE system.
+
+poly_ops.py: contains helper functions to simplify ring operations and sampling.
+
+r_lwe.py:   Contains helper functions for generating secret-public key pairs and 
+            shared secret calculation.
+
+*There is no way to close server.py gracefully. If you're running it with input.....*
+*methods available, just ^C it. If not, then you gotta just pull the plug. It's.....*
+*inelegant but hey, it works........................................................*
