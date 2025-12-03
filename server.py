@@ -107,17 +107,18 @@ class FTP_Session:
             # 1. Server samples m and sends it to server
             m = PO.sample_m()
 
-            # 2. Server generates public key P_A and secret key s_A
-            s_A, P_A = KeyGen(m)
-
             # 2. Send m to client
             self.send_response(225, "Sending public m")
             self.send_json(m.tolist())
+
+            # 2. Server generates public key P_A and secret key s_A
+            s_A, P_A = KeyGen(m)
 
             # 2a.Confirm client m same as sent m
 
             client_m_list = self.recv_json()
             if client_m_list is None: raise Exception("Did not receive confirmation m.")
+            
             m_confirm = np.array(client_m_list, dtype=int)
             if m_confirm is None: raise Exception("Did not receive m confirmation.")
             if m_confirm.any() != m.any(): raise Exception("m confirmation different from m.")
