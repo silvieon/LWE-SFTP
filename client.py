@@ -142,7 +142,10 @@ class FTPClient:
             m = np.array(server_m_list, dtype=int)
 
             # 2a.Confirm with re-send of m back to server
-            print("Received public m. Confirming with re-send.")
+            print("Received public m." 
+            "Confirming with re-send.\n" \
+            f"First eight elems: {m[:8]}" \
+            "")
             self._send_json(server_m_list)
 
             response = self._receive_response()
@@ -155,13 +158,17 @@ class FTPClient:
             # 3. Server generates intermediary shared key K_B and secret key s_B
             s_B, K_B = KeyGen(P_A)
 
+            print("Intermediary shared secret calculation done.")
+            print(f"{K_B}")
+
             # 4. Calculate intermediary public key P_B
             msB = PO.poly_mul(m, s_B)
             e   = PO.sample_small(k=K_ERROR)
-            mse = msB + 2 * e
-            P_B = PO.reduce_mod_q(mse)
+            P_B = PO.reduce_mod_q(msB + 2 * e)
+            # mse = msB + 2 * e
+            # P_B = PO.reduce_mod_q(mse)
 
-            # 5. Send intermediary public key P_B to server
+            # 5. Send public key P_B to server
             print("Intermediary shared key P_B SENT")
             self._send_json(P_B.tolist())
             response = self._receive_response()
@@ -181,7 +188,7 @@ class FTPClient:
             response = self._receive_response()
             if not response or not response.startswith('230'): raise Exception("Server key finalization failed.")
 
-            print(f"[KEY SUCCESS] Shared Key K established (First 8 bits: {SK_B[:8]})")
+            print(f"[KEY SUCCESS] Shared Key K established. {self.shared_key}")
             return True
         
         except Exception as e:

@@ -124,7 +124,8 @@ class FTP_Session:
             if m_confirm.any() != m.any(): raise Exception("m confirmation different from m.")
 
             print("" \
-            "public m sharing done." \
+            "public m sharing done.\n" \
+            f"First eight elems: {m[:8]}" \
             "")
 
             # 3. Send public key P_A to client
@@ -139,11 +140,15 @@ class FTP_Session:
             # 5. Calculate intermediary shared key K_A
             spB = PO.poly_mul(s_A, P_B)
             e   = PO.sample_small(k=K_ERROR)
-            spe = spB + 2 * e
-            K_A = PO.reduce_mod_q(spe)
+            K_A = PO.reduce_mod_q(spB + 2 * e)
+            # spe = spB + 2 * e
+            # K_A = PO.reduce_mod_q(spe)
+
+            print("Intermediary shared secret calculation done.")
+            print(f"{K_A}")
 
             self.send_response(227, "Received P_B. Sending reclamation hint.")
-            h = PO.sample_binary()
+            h = HelpRec(K_A)
             self.send_json(h.tolist())
             
             # 6. Calculate shared key SK_A
@@ -153,7 +158,7 @@ class FTP_Session:
             self.key_exchange_complete = True
             
             self.send_response(230, "Key Exchange successful. Ready for USER/PASS.")
-            print(f"[KEY SUCCESS] Shared Key K established.")
+            print(f"[KEY SUCCESS] Shared Key K established. {self.shared_key}")
             
         except Exception as e:
             print(f"[KEY EXCHANGE FAILED] {e}")
