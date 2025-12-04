@@ -8,7 +8,7 @@ import sys
 import numpy as np
 
 # Import constants and R-LWE functions
-from lwe_constants import N, Q, K_ERROR
+from lwe_constants import K_ERROR
 from ftp_constants import FTP_PORT, SERVER_HOST, BUFFER_SIZE, SERVER_ROOT, USER_CREDENTIALS
 
 from r_lwe import KeyGen, HelpRec, Rec

@@ -6,10 +6,10 @@ import json
 
 import numpy as np
 
-from lwe_constants import N, Q, K_ERROR, a
+from lwe_constants import K_ERROR
 from ftp_constants import SERVER_HOST, FTP_PORT, BUFFER_SIZE, TIMEOUT
 
-from r_lwe import KeyGen, HelpRec, Rec
+from r_lwe import KeyGen, Rec
 from poly_ops import PO # Get the pre-instantiated PolyOps object
 
 class FTPClient:

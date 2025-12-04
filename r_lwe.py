@@ -1,17 +1,11 @@
 import numpy as np
 from poly_ops import PO # Get the pre-instantiated PolyOps object
-from lwe_constants import N, Q, K_ERROR, a # Q is assumed to be the modulus 'q'
+from lwe_constants import Q, K_ERROR
 
-# --- DERIVED RECONCILIATION CONSTANTS ---
-# Q_MODULUS is assumed to be the ring modulus 'q' (from lwe_constants)
-Q_MODULUS = Q 
+# Helper constants for the key reconciliation step
+a = np.floor(Q / 4).astype(int) 
 
-# T = floor(q/4): The radius of the central region E for the Sig function.
-T = np.floor(Q_MODULUS / 4).astype(int) 
-
-# Q_HALF = (q-1)/2: The constant used in the Mod2 formula.
-Q_HALF = (Q_MODULUS - 1) // 2
-# ----------------------------------------
+Q_HALF = (Q - 1) // 2
 
 def KeyGen(A):
     """
@@ -23,7 +17,7 @@ def KeyGen(A):
     e = PO.sample_small(k=K_ERROR)
     a_times_s = PO.poly_mul(A, s)
     b = PO.reduce_mod_q(a_times_s + 2 * e)
-    return s, b # P is b
+    return s, b
 
 # ==============================================================================
 # 1. SIGNAL FUNCTION (Sig) - Implemented in HelpRec
@@ -33,7 +27,7 @@ def HelpRec(v):
     """
     Alice's Reconciliation Hint Generator (HelpRec), now implemented as Sig(v).
     Input: v = raw shared secret (v = B_B * s_A + 2*e_A_prime).
-    Output: h (The hint/correction factor 'w', polynomial of 0s and 1s).
+    Output: hint/correction factor 'w', polynomial of 0s and 1s.
     """
     # 1. Center the coefficients of v into the range [-(q-1)/2, (q-1)/2]
     # We use Q_MODULUS here for the centering operation.
@@ -41,7 +35,7 @@ def HelpRec(v):
 
     # 2. Apply the Sig function threshold: 
     # Sig(v) = 1 if |v_centered| > T (outside of E), 0 otherwise.
-    w = np.where(np.abs(v_centered) > T, 1, 0)
+    w = np.where(np.abs(v_centered) > a, 1, 0)
     
     # h is the reconciliation signal 'w'
     return w
@@ -53,8 +47,8 @@ def HelpRec(v):
 def Rec(k_raw, w_signal):
     """
     Bob's Shared Secret Recovery (Rec), now implemented as Mod2(k_A, w).
-    Input: w = raw shared secret (k_A or k_B)
-           h = Alice's reconciliation hint (w from Sig function).
+    Input: k = raw shared secret (k_A or k_B)
+           w = Alice's reconciliation hint (w from Sig function).
     Output: K (The final shared key sk_A or sk_B, a vector of 0s and 1s).
     """
 
