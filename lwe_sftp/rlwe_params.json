@@ -1,0 +1,22 @@
+{
+  "n": 1024,
+  "q": 7681,
+  "k": 4,
+  "selected_by": "tools/bench.py sweep --write",
+  "date": "2026-11-11",
+  "constraints": {
+    "min_classical_core_svp": 128,
+    "max_log2_failure": -64,
+    "min_k": 2,
+    "max_hello_bytes": 14480,
+    "tie_tolerance": 0.15
+  },
+  "estimates": {
+    "core_svp_classical": 252,
+    "core_svp_quantum": 228,
+    "bkz_blocksize": 862,
+    "log2_failure": "-83",
+    "exchange_ms": 0.469,
+    "hello_bytes": 7229
+  }
+}
