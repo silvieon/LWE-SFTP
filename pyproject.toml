@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lwe-sftp"
+dynamic = ["version"]
+description = "scp/sftp-style file transfer over a hybrid post-quantum (R-LWE + ML-KEM-768 + X25519) channel"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "cryptography>=50",   # ML-KEM support; developed against 50.0
+]
+
+[project.optional-dependencies]
+encrypted-keys = ["bcrypt"]   # needed to load passphrase-protected OpenSSH keys
+test = ["pytest"]
+
+[project.scripts]
+lscp = "lwe_sftp.cli:lscp"
+lsftp = "lwe_sftp.cli:lsftp"
+lsftpd = "lwe_sftp.cli:lsftpd"
+
+[tool.setuptools]
+packages = ["lwe_sftp"]
+
+[tool.setuptools.package-data]
+lwe_sftp = ["rlwe_params.json"]   # written by tools/bench.py sweep --write
+
+[tool.setuptools.dynamic]
+version = { attr = "lwe_sftp.__version__" }
