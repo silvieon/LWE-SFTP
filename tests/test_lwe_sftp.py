@@ -1,3 +1,13 @@
+"""Tests for LWE-SFTP.
+
+Covers R-LWE correctness (key agreement, exact multiplication, input validation), the client
+and server end to end over a real localhost socket (transfers, directory operations, root
+confinement, authentication, host-key pinning), record-layer integrity, the three command-line
+tools run as subprocesses, and R-LWE parameter selection and mismatch handling.
+
+Run with `pip install -e '.[test]' && pytest`.
+"""
+
 import os
 import socket
 import subprocess
@@ -18,6 +28,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # --- R-LWE -------------------------------------------------------------------
 
 def test_rlwe_agreement_many_runs():
+    """100 full R-LWE exchanges, including the hint's wire round trip, all agree on the key bits."""
     for _ in range(100):
         m, s, p = rlwe.initiate()
         p_r, hint, k_r = rlwe.respond(m, p)
@@ -26,6 +37,10 @@ def test_rlwe_agreement_many_runs():
 
 
 def test_rlwe_poly_mul_matches_naive():
+    """poly_mul matches an independent negacyclic product computed with exact Python integers.
+
+    The reference adds b[i] times a rotated by i places, negating coefficients that wrap past x^n.
+    """
     a, b = rlwe.sample_uniform(), rlwe.sample_cbd()
     naive = np.zeros(rlwe.N, dtype=object)
     for i in np.nonzero(b)[0]:
@@ -35,6 +50,7 @@ def test_rlwe_poly_mul_matches_naive():
 
 
 def test_rlwe_decode_rejects_bad_input():
+    """decode_poly raises ValueError on malformed input instead of returning garbage."""
     with pytest.raises(ValueError):
         rlwe.decode_poly(b"\x00" * 10)
     with pytest.raises(ValueError):
@@ -45,6 +61,12 @@ def test_rlwe_decode_rejects_bad_input():
 
 @pytest.fixture
 def env(tmp_path):
+    """A running Server on a random localhost port with one user, alice.
+
+    alice is confined to tmp/root and has both a password ("hunter2") and an Ed25519 key.
+    outside.txt sits next to the root, outside it, for the escape tests. Yields the paths and the
+    port, and shuts the server down afterwards.
+    """
     cfg = Config(str(tmp_path / "srv"))
     root = tmp_path / "root"
     root.mkdir()
@@ -67,12 +89,17 @@ def env(tmp_path):
 
 
 def connect(env, **kw):
+    """Connect as alice with the fixture's key and its own known_hosts, accepting the host key.
+
+    Keyword arguments override any of those defaults.
+    """
     opts = dict(user="alice", identity=env["key"], known_hosts=env["kh"], host_key_policy="accept-new")
     opts.update(kw)
     return Client("127.0.0.1", env["port"], **opts).connect()
 
 
 def test_put_get_roundtrip(env):
+    """A random file of several chunks survives upload and download byte for byte; stat reports its size."""
     data = os.urandom(300_000)  # several chunks
     src = env["tmp"] / "src.bin"
     src.write_bytes(data)
@@ -85,6 +112,7 @@ def test_put_get_roundtrip(env):
 
 
 def test_empty_file_and_dir_ops(env):
+    """A zero-byte upload, plus mkdir, listdir, rename, remove and rmdir."""
     src = env["tmp"] / "empty"
     src.write_bytes(b"")
     with connect(env) as c:
@@ -98,6 +126,7 @@ def test_empty_file_and_dir_ops(env):
 
 
 def test_recursive_tree(env):
+    """put_tree followed by get_tree reproduces a nested directory."""
     tree = env["tmp"] / "tree"
     (tree / "a" / "b").mkdir(parents=True)
     (tree / "a" / "b" / "x.txt").write_text("x")
@@ -110,6 +139,9 @@ def test_recursive_tree(env):
 
 
 def test_cannot_escape_root(env):
+    """'..' is clamped at the root, a symlink pointing outside is refused, and removing the symlink
+    deletes the link rather than its target.
+    """
     os.symlink(env["tmp"] / "outside.txt", env["root"] / "link")
     with connect(env) as c:
         # '..' is clamped at the root, so this is just /outside.txt inside the root
@@ -123,6 +155,7 @@ def test_cannot_escape_root(env):
 
 
 def test_password_auth_and_failure(env, monkeypatch):
+    """With no keys available, the right password logs in and a wrong one raises AuthError."""
     monkeypatch.setenv("HOME", str(env["tmp"] / "home"))  # no default identities
     monkeypatch.delenv("LWE_SFTP_DIR", raising=False)
     with connect(env, identity=None, password_prompt=lambda u, h: "hunter2") as c:
@@ -132,11 +165,13 @@ def test_password_auth_and_failure(env, monkeypatch):
 
 
 def test_unknown_user_rejected(env):
+    """A user who isn't in users.json can't log in, even with a valid key."""
     with pytest.raises(AuthError):
         connect(env, user="mallory")
 
 
 def test_host_key_change_detected(env):
+    """After a host key is pinned, a different key in known_hosts makes connect fail with "CHANGED"."""
     connect(env).close()  # records the key
     with open(env["kh"]) as f:
         line = f.read()
@@ -148,11 +183,13 @@ def test_host_key_change_detected(env):
 
 
 def test_strict_host_policy_refuses_unknown(env):
+    """The "strict" policy refuses a host that isn't in known_hosts."""
     with pytest.raises(HostKeyError):
         connect(env, host_key_policy="strict")
 
 
 def test_record_tampering_and_replay_detected():
+    """SecureChannel rejects a record with one flipped bit, and a valid record at the wrong sequence number."""
     from lwe_sftp.transport import SecureChannel
     a, b = socket.socketpair()
     k1, k2 = os.urandom(32), os.urandom(32)
@@ -179,6 +216,7 @@ def test_record_tampering_and_replay_detected():
 
 
 def test_lscp_cli(env):
+    """lscp as a subprocess: upload, download, and exit status 1 for a missing remote file."""
     f = env["tmp"] / "cli.txt"
     f.write_text("via cli")
     base = [sys.executable, "-c", "from lwe_sftp.cli import lscp; lscp()",
@@ -196,6 +234,7 @@ def test_lscp_cli(env):
 
 
 def test_lsftp_batch(env):
+    """lsftp -b runs a batch file; a failing command prefixed with '-' doesn't abort the run."""
     (env["tmp"] / "b.txt").write_text("batch")
     batch = env["tmp"] / "cmds"
     batch.write_text(f"mkdir sub\ncd sub\nput {env['tmp'] / 'b.txt'}\nls\n-rm nope\npwd\n")
@@ -209,6 +248,11 @@ def test_lsftp_batch(env):
 
 
 def test_lsftpd_admin_commands(tmp_path):
+    """lsftpd admin subcommands.
+
+    adduser reads several keys from stdin and ignores junk lines; host-key prints the same line as
+    host_ed25519.pub; install-service fills in the user, Python interpreter and port.
+    """
     k1 = keys.public_to_openssh(keys.generate_private_key(str(tmp_path / "k1")).public_key())
     k2 = keys.public_to_openssh(keys.generate_private_key(str(tmp_path / "k2")).public_key())
     base = [sys.executable, "-m", "lwe_sftp.cli", "lsftpd", "-c", str(tmp_path / "cfg")]
@@ -231,6 +275,10 @@ def test_lsftpd_admin_commands(tmp_path):
 @pytest.mark.parametrize("P", [rlwe.DEFAULT, rlwe.Params(2048, 8380417, 2), rlwe.Params(256, 3329, 2),
                                rlwe.Params(2048, 8380417, 16)])
 def test_fft_mul_exact(P):
+    """FFT multiplication equals the schoolbook product for several parameter sets.
+
+    Includes the worst case for floating-point rounding, with every coefficient at its extreme.
+    """
     for _ in range(5):
         a, b = rlwe.sample_uniform(P), rlwe.sample_cbd(P)
         assert np.array_equal(rlwe.poly_mul(a, b, P), rlwe.poly_mul_schoolbook(a, b, P))
@@ -241,17 +289,20 @@ def test_fft_mul_exact(P):
 
 
 def test_params_too_large_for_fft_rejected():
+    """Params refuses sets where float64 FFT multiplication could round incorrectly."""
     with pytest.raises(ValueError):
         rlwe.Params(4096, 2 ** 31 - 1, 16)
 
 
 def test_handshake_rejects_rlwe_param_mismatch():
+    """A client on a different R-LWE set gets a clear "parameter mismatch" error, and so does the server."""
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
     from lwe_sftp.transport import HandshakeError, client_handshake, server_handshake
     a, b = socket.socketpair()
     errs = []
 
     def srv():
+        """Server half of the handshake, run in a thread; records the HandshakeError it raises."""
         try:
             server_handshake(b, Ed25519PrivateKey.generate())
         except HandshakeError as e:
@@ -266,6 +317,10 @@ def test_handshake_rejects_rlwe_param_mismatch():
 
 
 def test_params_resolution_order(tmp_path, monkeypatch):
+    """resolve_params prefers override > environment > config-dir file > packaged file.
+
+    Also checks that parse rejects an even modulus.
+    """
     import json as _json
     monkeypatch.delenv(rlwe.ENV_VAR, raising=False)
     assert rlwe.resolve_params() == rlwe.DEFAULT == rlwe.Params.load(rlwe.PACKAGED_PARAMS)
@@ -280,6 +335,9 @@ def test_params_resolution_order(tmp_path, monkeypatch):
 
 def test_client_server_custom_params_and_mismatch(env, monkeypatch):
     # the env fixture's server uses the packaged default; a client on other params is refused clearly
+    """A client on other parameters is refused, and a client and server that both use the same
+    non-default parameters work end to end.
+    """
     from lwe_sftp.transport import HandshakeError
     with pytest.raises(HandshakeError, match="parameter mismatch"):
         connect(env, rlwe_params="2048,12289,2")

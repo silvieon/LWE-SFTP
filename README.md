@@ -112,6 +112,109 @@ lsftp -b commands.txt server3:/docs
 `lsftp` commands: `ls cd pwd lcd lpwd lls get [-r] [-p] put [-r] [-p] mkdir rmdir rm rename/mv exit`.
 In batch mode the first failing command aborts the run; prefix a line with `-` to ignore its failure (same as sftp).
 
+## Architecture
+
+The code is a stack of four layers. Each layer only talks to the one directly below it, and the
+client and server share everything from the transport layer down.
+
+```
+            client side                                   server side
+  ┌──────────────────────────────┐            ┌──────────────────────────────────┐
+  │ lscp · lsftp       (cli.py)  │            │ lsftpd serve / adduser … (cli.py)│  front ends
+  ├──────────────────────────────┤            ├──────────────────────────────────┤
+  │ Client          (client.py)  │            │ Server → Session    (server.py)  │  login, file ops
+  ├──────────────────────────────┤            ├──────────────────────────────────┤
+  │ client_handshake             │  ◄─ TCP ─► │ server_handshake                 │  transport.py
+  │ SecureChannel                │            │ SecureChannel                    │
+  ├──────────────────────────────┴────────────┴──────────────────────────────────┤
+  │ rlwe.py (R-LWE exchange, parameters) · keys.py (Ed25519, known_hosts, scrypt)│  primitives
+  └──────────────────────────────────────────────────────────────────────────────┘
+```
+
+| Layer | Module | Responsibility |
+|---|---|---|
+| Front ends | `cli.py` | Argument parsing, terminal prompts, progress meter, scp/sftp path rules, the `lsftp` shell, server administration |
+| Session | `client.py`, `server.py` | Client: host-key check, login, one method per operation, file and tree transfers. Server: one thread per connection, login against `users.json`, request dispatch, root-directory confinement |
+| Transport | `transport.py` | One-round-trip hybrid handshake, then ChaCha20-Poly1305 records |
+| Primitives | `rlwe.py`, `keys.py` | Ring-LWE ring arithmetic, reconciliation and parameter sets; OpenSSH-format Ed25519 keys, `known_hosts`, password hashes |
+
+### A connection, start to finish
+
+1. **Front end.** `lscp`/`lsftp` parse `user@host:path` and build a `Client` with terminal
+   callbacks for passwords, key passphrases and unknown host keys.
+2. **Handshake.** `Client.connect()` opens TCP and calls `client_handshake`. On the server,
+   `Server` gives the socket its own thread and a `Session`, which calls `server_handshake`.
+   After one round trip, both sides hold a `SecureChannel` keyed from all three key exchanges.
+   The transcript hash doubles as the session id.
+3. **Host key.** The client compares the server's signed Ed25519 key with `known_hosts`:
+   a match passes, an unknown key goes to the trust-on-first-use policy, and a changed key is
+   always refused.
+4. **Login.** The client signs `context || session id || user` with each candidate Ed25519 key
+   in turn, then falls back to a password. The server reads `users.json` again for every
+   attempt, so user changes apply without a restart. It checks the key or the scrypt hash and
+   fixes the session's root directory.
+5. **Requests.** Every operation is a JSON request followed by a JSON reply on the encrypted
+   channel. The server keeps no working directory; `lsftp`'s `cd` lives on the client side.
+6. **Close.** The client closes the socket and the server thread ends. There is no rekeying.
+
+### Messages on the channel
+
+Each record has a kind: `MSG` (a JSON object), `DATA` (raw file bytes, up to 64 KiB) or `EOD`
+(the end of a data stream, carrying `{"ok", "error"}`).
+
+| op | Request fields | Server reply |
+|---|---|---|
+| `auth` | `user`, `method`, then `key` + `sig` or `password` | `{ok, user}` or `{ok: false, error}` |
+| `stat` | `path` | `{type, size, mode, mtime}` |
+| `list` | `path` | one or more `{entries, more}` batches of up to 2000 entries |
+| `get` | `path` | attributes, then `DATA`… and `EOD` |
+| `put` | `path`, `size`, optional `mode`/`mtime` | go-ahead `{ok}`; client sends `DATA`… `EOD`; then a final `{ok, error}` |
+| `mkdir` `rmdir` `remove` | `path` | `{ok}` |
+| `rename` | `src`, `dst` | `{ok}` |
+
+### Invariants worth knowing before changing the code
+
+* **Streams always end with `EOD`, even after an error.** A side that hits a local error keeps
+  reading until `EOD` and discards the data, so requests and replies never get out of step.
+* **Writes are atomic on both ends.** Uploads and downloads go to a temp file in the destination
+  directory and are renamed into place only once complete and checked. `users.json` is written
+  the same way.
+* **All paths are resolved inside the user's root** (`Session._resolve`). `..` is clamped at
+  `/` and symlinks are resolved before the containment check. Operations that change a path
+  (`put`, `mkdir`, `rmdir`, `remove`, `rename`) resolve only the parent, so they act on a
+  symlink itself and never on its target.
+* **Confidentiality needs only one of the three exchanges to hold.** Their shared secrets are
+  combined in one HKDF call, so the R-LWE parameters can be changed freely without making the
+  channel weaker than ML-KEM + X25519.
+* **R-LWE parameters are data.** `rlwe.resolve_params` picks them (see
+  [R-LWE parameters](#r-lwe-parameters)). The client hello names the set, and the server
+  refuses a mismatch with an error that names its own set.
+
+### State on disk
+
+| Where | Files |
+|---|---|
+| Client: `~/.lwe-sftp/` or `$LWE_SFTP_DIR` | `known_hosts`, optional `id_ed25519`, optional `rlwe_params.json` |
+| Server: `~/.config/lwe-sftpd/`, `/etc/lwe-sftpd/` as root, `$LWE_SFTPD_DIR` or `-c DIR` | `host_ed25519` and `.pub`, `users.json`, optional `rlwe_params.json` |
+
+### Source layout
+
+| File | Contents |
+|---|---|
+| `lwe_sftp/__init__.py` | version, protocol identifier, default port |
+| `lwe_sftp/rlwe.py` | ring arithmetic (FFT multiplication), sampling (os.urandom), KeyGen / Sig (HelpRec) / Mod2 (Rec), parameter loading |
+| `lwe_sftp/rlwe_params.json` | the R-LWE parameter set in use, generated by the benchmark |
+| `lwe_sftp/transport.py` | hybrid handshake and host-key signature, framing, AEAD record layer |
+| `lwe_sftp/keys.py` | key files, known_hosts, scrypt passwords |
+| `lwe_sftp/server.py` | `Server`, per-connection `Session`, `Config` (host key, `users.json`) |
+| `lwe_sftp/client.py` | `Client`: connect, host-key check, login, operations, transfers |
+| `lwe_sftp/cli.py` | `lscp`, `lsftp` (with its `Shell`), `lsftpd` |
+| `tests/test_lwe_sftp.py` | unit tests and end-to-end tests against a real local server |
+| `tools/bench.py` | parameter sweep, estimator validation, handshake benchmark |
+| `tools/deploy.sh` | install and start the server on hosts over SSH |
+
+Every module and function has a docstring describing what it does and how.
+
 ## Protocol
 
 One TCP connection per session. The handshake takes one round trip:
@@ -131,16 +234,6 @@ authenticates with an Ed25519 signature over the session hash, or with a scrypt-
 Because the three shared secrets are combined, the session stays confidential if **any one**
 of the three exchanges holds. That means the R-LWE parameters can be tuned or experimented
 with (see below) without making the channel weaker than ML-KEM + X25519 alone.
-
-| File | Contents |
-|---|---|
-| `lwe_sftp/rlwe.py` | ring arithmetic (FFT multiplication), sampling (os.urandom), KeyGen / Sig (HelpRec) / Mod2 (Rec), parameter loading |
-| `lwe_sftp/rlwe_params.json` | the R-LWE parameter set in use, generated by the benchmark |
-| `tools/bench.py` | parameter sweep, estimator validation, handshake benchmark |
-| `tools/deploy.sh` | install + start the server on hosts over SSH |
-| `lwe_sftp/transport.py` | hybrid handshake + host-key signature, framing and AEAD record layer |
-| `lwe_sftp/keys.py` | key files, known_hosts, scrypt passwords |
-| `lwe_sftp/server.py`, `client.py`, `cli.py` | server, client library, commands |
 
 Tests: `pip install -e '.[test]' && pytest`.
 

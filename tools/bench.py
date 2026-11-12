@@ -1,5 +1,9 @@
 """R-LWE parameter benchmarks: speed vs. estimated security vs. key-mismatch rate.
 
+A developer tool, not part of the installed package. It measures candidate (n, q, k) sets,
+estimates their security and failure rate, and selects the set written to
+lwe_sftp/rlwe_params.json, which both ends of the protocol then load.
+
     python tools/bench.py sweep                  # sweep (n, q, k), print a markdown table + the selected set
     python tools/bench.py sweep --write          # ...and write it to lwe_sftp/rlwe_params.json
     python tools/bench.py sweep --csv out.csv    # ...and dump every measured row
@@ -41,10 +45,16 @@ TCP_INITIAL_WINDOW = 10 * 1448  # Linux initcwnd 10 segments: bytes a peer can s
 # --- security estimate ------------------------------------------------------
 
 def _delta(b):
+    """Root-Hermite factor delta_b that BKZ with block size b achieves (standard asymptotic formula)."""
     return ((math.pi * b) ** (1 / b) * b / (2 * math.pi * math.e)) ** (1 / (2 * (b - 1)))
 
 
 def primal_blocksize(n, q, sigma):
+    """Smallest BKZ block size b for which the primal uSVP attack succeeds, or None.
+
+    For each number of samples m from n/8 to n (in steps of n/64), scans b upward and takes the
+    first that satisfies the inequality in the module docstring; returns the smallest over all m.
+    """
     best = None
     for m in range(max(n // 8, 16), n + 1, max(n // 64, 1)):
         d = n + m + 1
@@ -57,6 +67,11 @@ def primal_blocksize(n, q, sigma):
 
 
 def security(P):
+    """Core-SVP estimate for P. Returns (b, classical bits, quantum bits).
+
+    Feeds the error width sigma = sqrt(k/2) to primal_blocksize; the costs are 0.292 b and 0.265 b
+    bits. Returns (None, 0, 0) if no block size works.
+    """
     b = primal_blocksize(P.n, P.q, math.sqrt(P.k / 2))
     if b is None:
         return None, 0.0, 0.0
@@ -66,6 +81,12 @@ def security(P):
 # --- failure estimate -------------------------------------------------------
 
 def log2_failure(P):
+    """Analytic log2 probability that an exchange disagrees on at least one key bit.
+
+    Models each coefficient's difference v_i - v_r as Gaussian with variance
+    4(2n sigma^4 + 2 sigma^2). Takes the expected overshoot past q/4, divided by q/2, as the
+    per-coefficient failure probability, and multiplies by n (union bound).
+    """
     s2 = P.k / 2
     var = 4 * (2 * P.n * s2 * s2 + 2 * s2)
     sd = math.sqrt(var)
@@ -79,6 +100,7 @@ def log2_failure(P):
 
 
 def empirical_failure(P, trials):
+    """Run trials full exchanges with P and return the fraction whose key bits disagree."""
     bad = 0
     for _ in range(trials):
         m, s, pub = rlwe.initiate(P)
@@ -88,13 +110,19 @@ def empirical_failure(P, trials):
 
 
 def _fmt_fail(lf):
+    """Format a log2 failure rate, collapsing astronomically small values to '< -1000'."""
     return "< -1000" if lf < -1000 else f"{lf:.0f}"
 
 
 # --- timing and size --------------------------------------------------------
 
 def time_exchange(P, budget=0.4):
+    """Median wall time in ms of one full exchange (initiate, respond, finish) with P.
+
+    Warms up once, then repeats for budget seconds and at least 20 times.
+    """
     def once():
+        """One complete R-LWE exchange, both roles in this process."""
         m, s, pub = rlwe.initiate(P)
         pr, w, _ = rlwe.respond(m, pub, P)
         rlwe.finish(s, pr, w, P)
@@ -109,29 +137,42 @@ def time_exchange(P, budget=0.4):
 
 
 def hello_bytes(P):
-    """Size of the client hello on the wire (JSON + base64), matching lwe_sftp/transport.py."""
+    """Size of the client hello on the wire (JSON + base64), matching lwe_sftp/transport.py.
+
+    Frame length prefix plus fixed JSON overhead, plus the base64 sizes of the X25519 key, the
+    ML-KEM-768 encapsulation key and two R-LWE polynomials.
+    """
     b64 = lambda n: 4 * ((n + 2) // 3)  # noqa: E731
     return 4 + 120 + len(P.name) + b64(32) + b64(1184) + 2 * b64(P.poly_bytes)
 
 
 class _CountingSocket:
+    """Socket wrapper that counts the bytes sent through it, to measure handshake traffic."""
     def __init__(self, sock):
+        """Wrap sock with a zeroed byte counter."""
         self.sock, self.sent = sock, 0
 
     def sendall(self, data):
+        """Count the bytes, then send them."""
         self.sent += len(data)
         self.sock.sendall(data)
 
     def recv(self, n):
+        """Pass through to the wrapped socket."""
         return self.sock.recv(n)
 
 
 def _one_handshake(P, host_key):
+    """Run one real client/server handshake over a socketpair, the server in a thread.
+
+    Returns (seconds, client-to-server bytes, server-to-client bytes) and re-raises any server error.
+    """
     a, b = socket.socketpair()
     ca, cb = _CountingSocket(a), _CountingSocket(b)
     err = []
 
     def server():
+        """Server half, run in the thread; stores any exception for the caller."""
         try:
             transport.server_handshake(cb, host_key, P)
         except Exception as e:  # surfaced below
@@ -151,6 +192,10 @@ def _one_handshake(P, host_key):
 
 
 def bench_handshake(P, runs=300):
+    """Time runs handshakes with one host key after a warm-up.
+
+    Returns (median ms, 95th-percentile ms, client-to-server bytes, server-to-client bytes).
+    """
     key = Ed25519PrivateKey.generate()
     _one_handshake(P, key)
     times = []
@@ -168,6 +213,11 @@ KS = [1, 2, 4, 8, 16]
 
 
 def sweep():
+    """Measure every (n, q, k) in NS x QS x KS that Params accepts. Returns a list of row dicts.
+
+    Sets that fail more often than 2^-20 are skipped before timing. Each remaining set gets its
+    exchange time, failure estimate, security estimate and hello size; progress goes to stderr.
+    """
     rows = []
     for n in NS:
         for q in QS:
@@ -188,7 +238,12 @@ def sweep():
 
 
 def select(rows, args):
-    """Fastest-ish set that meets every constraint; among near-ties, the most secure one."""
+    """Fastest-ish set that meets every constraint; among near-ties, the most secure one.
+
+    Keeps rows meeting the four thresholds (security, failure, k, hello size), sorts them by speed,
+    treats every row within tolerance of the fastest as a tie, and picks the tie with the highest
+    classical security, then the lowest failure. Returns (chosen row or None, qualifying rows).
+    """
     ok = [r for r in rows
           if r["classical"] >= args.min_classical and r["log2_fail"] <= args.max_log2_fail
           and r["k"] >= args.min_k and r["hello_bytes"] <= args.max_hello_bytes]
@@ -202,6 +257,11 @@ def select(rows, args):
 # --- commands ---------------------------------------------------------------
 
 def cmd_validate(args):
+    """'validate': print the estimators next to reference values.
+
+    The security estimator is compared with NewHope's published figure, and the failure model with
+    measured failure rates for sets chosen to fail often enough to measure.
+    """
     print("Estimator vs. NewHope paper (primal, classical core-SVP):")
     for n, q, k, paper in [(1024, 12289, 16, 282), (512, 12289, 8, None)]:
         b, cls, qnt = security(Params(n, q, k))
@@ -215,6 +275,13 @@ def cmd_validate(args):
 
 
 def cmd_sweep(args):
+    """'sweep': run the sweep, report it, and optionally save the selection.
+
+    Optionally dumps every row to CSV. Prints a markdown table of qualifying sets (speed relative
+    to the current default, security, failure, hello size) marking the current default and the
+    selection. With --write, saves the selected set with its constraints and estimates as the
+    parameters file. Exits 1 if no set qualifies.
+    """
     rows = sweep()
     if args.csv:
         with open(args.csv, "w", newline="") as f:
@@ -258,6 +325,11 @@ def cmd_sweep(args):
 
 
 def cmd_handshake(args):
+    """'handshake': benchmark full handshakes for the given sets, or a default list.
+
+    Prints a markdown table of median and p95 times, bytes each way, and whether the client hello
+    fits in the TCP initial window.
+    """
     sets = [Params.parse(a) for a in args.sets] or [
         rlwe.DEFAULT, Params(2048, 8380417, 2), Params(2048, 12289, 2), Params(1024, 12289, 4), Params(1024, 12289, 2),
     ]
@@ -271,6 +343,7 @@ def cmd_handshake(args):
 
 
 def main():
+    """Parse the subcommand and its options, then dispatch to the matching cmd_* function."""
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
 

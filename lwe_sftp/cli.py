@@ -1,4 +1,16 @@
-"""Command-line entry points: lscp, lsftp, lsftpd."""
+"""Command-line entry points: lscp, lsftp, lsftpd.
+
+    lscp    scp-style copy of files and directories to or from one server
+    lsftp   sftp-style interactive shell, or a batch of commands with -b
+    lsftpd  run the server, and administer its users and host key
+
+Each *_main function parses its arguments with argparse and returns an exit code. The lscp,
+lsftp and lsftpd objects at the bottom wrap them as console-script entry points (see
+pyproject.toml). The client tools build a client.Client with terminal prompts for passwords,
+key passphrases and unknown host keys; lsftpd drives server.Server and edits users.json through
+server.Config. `python -m lwe_sftp.cli <tool> ...` runs any of them without depending on PATH,
+which is what the generated systemd unit uses.
+"""
 
 import argparse
 import cmd
@@ -23,6 +35,7 @@ CONNECT_ERRORS = (OSError, AuthError, HostKeyError, HandshakeError, ProtocolErro
 # --- shared helpers ----------------------------------------------------------
 
 def _add_conn_args(p):
+    """Add the options lscp and lsftp share: port, identity, host-key policy, R-LWE set, --version."""
     p.add_argument("-P", "--port", type=int, default=DEFAULT_PORT, help=f"server port (default {DEFAULT_PORT})")
     p.add_argument("-i", "--identity", help="Ed25519 private key (default ~/.lwe-sftp/id_ed25519, then ~/.ssh/id_ed25519)")
     p.add_argument("--accept-new-host", action="store_true", help="trust unknown host keys without asking (TOFU)")
@@ -33,6 +46,11 @@ def _add_conn_args(p):
 
 
 def _split_userhost(s):
+    """Split '[user@]host' into (user, host).
+
+    Splits at the last '@', strips IPv6 brackets from the host, and defaults the user to the local
+    login name.
+    """
     user, _, host = s.rpartition("@")
     if host.startswith("[") and host.endswith("]"):
         host = host[1:-1]
@@ -40,6 +58,11 @@ def _split_userhost(s):
 
 
 def _confirm_host(label, fp):
+    """Ask on the terminal whether to trust an unknown host key, OpenSSH-style.
+
+    Prints the label and fingerprint to stderr and asks until the answer is yes, no or empty
+    (empty means no). Without a terminal on stdin it refuses.
+    """
     if not sys.stdin.isatty():
         return False
     sys.stderr.write(f"The authenticity of host '{label}' can't be established.\n"
@@ -53,6 +76,10 @@ def _confirm_host(label, fp):
 
 
 def _password_prompt(user, host):
+    """Read a password without echo.
+
+    Returns None, which skips password login, when stdin isn't a terminal or the user cancels.
+    """
     if not sys.stdin.isatty():
         return None
     try:
@@ -62,6 +89,10 @@ def _password_prompt(user, host):
 
 
 def _make_client(user, host, args):
+    """Build a Client for user@host from parsed connection options.
+
+    Maps --accept-new-host / --strict-host to a host-key policy and wires in the terminal prompts.
+    """
     policy = "accept-new" if args.accept_new_host else "strict" if args.strict_host else "ask"
     return Client(
         host, args.port, user, identity=args.identity, password_prompt=_password_prompt,
@@ -71,6 +102,7 @@ def _make_client(user, host, args):
 
 
 def _human(n):
+    """Format a byte count with a binary unit (B, KB, MB, GB, TB) for the progress meter."""
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if n < 1024 or unit == "TB":
             return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
@@ -81,15 +113,23 @@ class Progress:
     """scp-style single-line progress on stderr."""
 
     def __init__(self, enabled):
+        """Show progress only if it was requested and stderr is a terminal."""
         self.enabled = enabled and sys.stderr.isatty()
 
     def for_file(self, name):
+        """Return a progress callback for one file, or None when progress is off.
+
+        The callback redraws one line with the file name (cut to 40 characters), percent done, bytes
+        done and the average rate since the start, and ends the line when the transfer completes. The
+        0% line is drawn immediately.
+        """
         if not self.enabled:
             return None
         start = time.monotonic()
         label = os.path.basename(name.rstrip("/")) or name
 
         def cb(done, total):
+            """Redraw the progress line for done of total bytes."""
             elapsed = max(time.monotonic() - start, 1e-6)
             pct = 100 if total == 0 else int(done * 100 / total)
             sys.stderr.write(f"\r{label[:40]:<40} {pct:3d}% {_human(done):>9} {_human(done / elapsed):>9}/s")
@@ -101,14 +141,21 @@ class Progress:
 
 
 def _rjoin(base, path):
-    """Resolve a remote path against a remote cwd ('/' is the user's root)."""
+    """Resolve a remote path against a remote cwd ('/' is the user's root).
+
+    Joins and normalizes with POSIX rules; an empty path means the cwd itself.
+    """
     return posixpath.normpath(posixpath.join(base, path)) if path else base
 
 
 # --- lscp ------------------------------------------------------------------
 
 def _parse_spec(s):
-    """scp rule: 'host:path' is remote if a ':' appears before any '/'."""
+    """scp rule: 'host:path' is remote if a ':' appears before any '/'.
+
+    Returns (user, host, path) for a remote spec, where an empty path becomes '.' (the user's
+    root), or None for a local path.
+    """
     head, sep, path = s.partition(":")
     if sep and head and "/" not in head:
         user, host = _split_userhost(head)
@@ -117,6 +164,13 @@ def _parse_spec(s):
 
 
 def lscp_main(argv=None):
+    """lscp: copy files between this machine and one server. Returns the exit status.
+
+    Parses each source and the target as local or remote and enforces scp's rules: exactly one side
+    remote, every remote path on the same user@host. Connects once, then uploads or downloads.
+    Per-file errors are printed and counted rather than ending the run. Exit status: 0 if
+    everything copied, 1 if some file failed, 255 if the connection couldn't be set up.
+    """
     p = argparse.ArgumentParser(
         prog="lscp", description="Copy files over an LWE-SFTP (post-quantum hybrid) connection, scp-style.",
         epilog="examples:  lscp file.txt alice@host:docs/    lscp -r alice@host:project ./backup",
@@ -147,6 +201,7 @@ def lscp_main(argv=None):
     failures = []
 
     def fail(path, err):
+        """Record a per-file failure and print it to stderr."""
         failures.append(path)
         print(f"lscp: {path}: {err}", file=sys.stderr)
 
@@ -168,6 +223,12 @@ def lscp_main(argv=None):
 
 
 def _upload(client, sources, target, args, progress, fail):
+    """Copy local sources to a remote target.
+
+    As with scp: if the target is an existing remote directory, each source goes inside it under
+    its own name; otherwise the target is the destination name, which is only allowed for a single
+    source. Directories need -r and go through put_tree.
+    """
     target = _rjoin("/", target)
     target_is_dir = client.is_dir(target)
     if len(sources) > 1 and not target_is_dir:
@@ -189,6 +250,11 @@ def _upload(client, sources, target, args, progress, fail):
 
 
 def _download(client, sources, target, args, progress, fail):
+    """Copy remote sources to a local target, the mirror of _upload.
+
+    Each source is stat'ed to choose between get and get_tree (directories need -r). An existing
+    local directory as target receives the sources inside it.
+    """
     target_is_dir = os.path.isdir(target)
     if len(sources) > 1 and not target_is_dir:
         fail(target, "not a directory")
@@ -213,6 +279,7 @@ def _download(client, sources, target, args, progress, fail):
 # --- lsftp -------------------------------------------------------------------
 
 def _fmt_entry(e):
+    """Format one listing entry like ls -l: type and permissions, size, mtime, name ('/' after dirs)."""
     kind = {"dir": "d", "file": "-"}.get(e["type"], "?")
     perms = stat.filemode(e["mode"])[1:]
     when = time.strftime("%b %d %H:%M", time.localtime(e["mtime"]))
@@ -220,10 +287,18 @@ def _fmt_entry(e):
 
 
 class Shell(cmd.Cmd):
+    """The lsftp command interpreter, built on cmd.Cmd.
+
+    Each do_<name> method is a command, and its docstring is that command's help text. Remote paths
+    resolve against self.cwd, a remote working directory kept on the client side; local paths use
+    the process's working directory. self.failed records whether any command failed, for batch mode
+    and the exit status.
+    """
     intro = None
     prompt = "lsftp> "
 
     def __init__(self, client, cwd="/"):
+        """Wrap a connected Client, starting in remote directory cwd, with a progress meter."""
         super().__init__()
         self.client = client
         self.cwd = cwd
@@ -231,9 +306,15 @@ class Shell(cmd.Cmd):
         self.progress = Progress(True)
 
     def r(self, path):
+        """Resolve a remote path argument against the current remote directory."""
         return _rjoin(self.cwd, path)
 
     def onecmd(self, line):
+        """Run one command line. Returns True to end the session.
+
+        A leading '-' allows the command to fail (sftp batch syntax). Remote, local and usage errors
+        are printed instead of ending the session, and set self.failed unless the line had the '-'.
+        """
         line = line.strip()
         ignore_err = line.startswith("-")
         if ignore_err:
@@ -247,18 +328,25 @@ class Shell(cmd.Cmd):
             return False
 
     def emptyline(self):
+        """Do nothing on an empty line (cmd.Cmd's default repeats the previous command)."""
         return False
 
     def default(self, line):
+        """Handle an unknown command: print an error and mark the session failed."""
         print(f"unknown command: {line.split()[0]} (try 'help')", file=sys.stderr)
         self.failed = True
 
     @staticmethod
     def _args(arg):
+        """Split an argument string shell-style. Returns (positional arguments, set of flags).
+
+        Any word that starts with '-' and is longer than one character counts as a flag.
+        """
         parts = shlex.split(arg)
         flags = {a for a in parts if a.startswith("-") and len(a) > 1}
         return [a for a in parts if a not in flags], flags
 
+    # Stats the path first: a directory is listed with listdir, a file is shown as a one-line listing.
     def do_ls(self, arg):
         """ls [path] - list a remote directory"""
         paths, _ = self._args(arg)
@@ -270,6 +358,7 @@ class Shell(cmd.Cmd):
 
     do_dir = do_ls
 
+    # Changes self.cwd only after the server confirms the target exists and is a directory.
     def do_cd(self, arg):
         """cd [path] - change remote directory ('/' is your root)"""
         path = self.r(arg.strip() or "/")
@@ -277,24 +366,30 @@ class Shell(cmd.Cmd):
             raise RemoteError(f"{path}: not a directory")
         self.cwd = path
 
+    # Prints self.cwd; the server keeps no per-session working directory.
     def do_pwd(self, arg):
         """pwd - print remote directory"""
         print(f"Remote working directory: {self.cwd}")
 
+    # os.chdir in this process; no argument means the home directory.
     def do_lcd(self, arg):
         """lcd path - change local directory"""
         os.chdir(os.path.expanduser(arg.strip() or "~"))
 
+    # Prints this process's working directory.
     def do_lpwd(self, arg):
         """lpwd - print local directory"""
         print(f"Local working directory: {os.getcwd()}")
 
+    # Lists names only, sorted, with '/' after directories.
     def do_lls(self, arg):
         """lls [path] - list a local directory"""
         path = arg.strip() or "."
         for name in sorted(os.listdir(path)):
             print(name + ("/" if os.path.isdir(os.path.join(path, name)) else ""))
 
+    # The destination defaults to the remote basename in the local cwd; an existing local directory
+    # receives the file inside it. Directories need -r (get_tree); -p keeps mode and mtime.
     def do_get(self, arg):
         """get [-r] [-p] remote [local] - download"""
         paths, flags = self._args(arg)
@@ -312,6 +407,8 @@ class Shell(cmd.Cmd):
         else:
             self.client.get(src, dest, preserve, self.progress.for_file(src))
 
+    # The destination defaults to the local basename in the remote cwd; an explicit remote directory
+    # receives the file inside it. Directories need -r (put_tree); -p keeps mode and mtime.
     def do_put(self, arg):
         """put [-r] [-p] local [remote] - upload"""
         paths, flags = self._args(arg)
@@ -330,19 +427,23 @@ class Shell(cmd.Cmd):
         else:
             self.client.put(src, dest, preserve, self.progress.for_file(src))
 
+    # The path resolves against the remote cwd.
     def do_mkdir(self, arg):
         """mkdir path - create remote directory"""
         self.client.mkdir(self.r(arg.strip()))
 
+    # The path resolves against the remote cwd; the server refuses non-empty directories.
     def do_rmdir(self, arg):
         """rmdir path - remove empty remote directory"""
         self.client.rmdir(self.r(arg.strip()))
 
+    # Removes each argument in turn; the first failure stops the rest.
     def do_rm(self, arg):
         """rm path... - remove remote files"""
         for p in shlex.split(arg):
             self.client.remove(self.r(p))
 
+    # Both paths resolve against the remote cwd; the server does a single os.rename.
     def do_rename(self, arg):
         """rename old new - rename/move a remote file"""
         paths, _ = self._args(arg)
@@ -352,18 +453,28 @@ class Shell(cmd.Cmd):
 
     do_mv = do_rename
 
+    # Returning True ends cmdloop().
     def do_exit(self, arg):
         """exit - close the session"""
         return True
 
     do_quit = do_bye = do_exit
 
+    # Ctrl-D ends the session; prints a newline so the terminal prompt starts on a fresh line.
+    # (No docstring on purpose: cmd.Cmd would list it as a documented command.)
     def do_EOF(self, arg):
         print()
         return True
 
 
 def lsftp_main(argv=None):
+    """lsftp: an sftp-style session with one server. Returns the exit status.
+
+    Parses '[user@]host[:path]', connects, and starts a Shell in path. Interactively it runs
+    cmdloop. With -b it feeds the batch file (or stdin for '-') line by line, stopping at exit or
+    at the first failing command not prefixed with '-'. Exit status: 0 on success, 1 if a command
+    or the connection failed, 255 if the connection couldn't be set up.
+    """
     p = argparse.ArgumentParser(prog="lsftp", description="Interactive LWE-SFTP client (sftp-style).")
     p.add_argument("-b", "--batch", metavar="FILE",
                    help="run commands from FILE ('-' = stdin); stop at the first error unless the line starts with '-'")
@@ -408,6 +519,19 @@ def lsftp_main(argv=None):
 # --- lsftpd ----------------------------------------------------------------
 
 def lsftpd_main(argv=None):
+    """lsftpd: the server and its administration, one subcommand per task. Returns the exit status.
+
+        serve            bind a Server and run until Ctrl-C or SIGTERM
+        adduser          create or update a user: root directory (created if missing), authorized
+                         keys (from a file, stdin or a literal line; duplicates skipped) and/or a
+                         password (asked twice, stored as an scrypt hash)
+        deluser, users   remove a user, list users
+        fingerprint      print the host key fingerprint
+        host-key         print the host public key line, for known_hosts
+        install-service  print a systemd unit that runs this Python and this config directory
+    All subcommands work on the config directory from -c, else default_config_dir(). The host key
+    is created on first use by any subcommand that needs it.
+    """
     p = argparse.ArgumentParser(prog="lsftpd", description="LWE-SFTP server and user administration.")
     p.add_argument("-c", "--config-dir", default=None, help=f"config directory (default {default_config_dir()})")
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -469,6 +593,7 @@ def lsftpd_main(argv=None):
             return 1
 
         def _on_term(*_):
+            """SIGTERM handler: raise KeyboardInterrupt so serve_forever unwinds through the normal shutdown."""
             raise KeyboardInterrupt
         signal.signal(signal.SIGTERM, _on_term)
         print(f"lsftpd {__version__} listening on {args.listen}:{args.port}  "
@@ -540,7 +665,13 @@ def lsftpd_main(argv=None):
 
 
 def _entry(fn):
+    """Wrap a *_main function as a console-script entry point.
+
+    The wrapper exits with the function's return code, and with 130 on Ctrl-C instead of printing
+    a traceback.
+    """
     def run():
+        """Call fn and turn its result, or a Ctrl-C, into the process exit status."""
         try:
             sys.exit(fn())
         except KeyboardInterrupt:

@@ -1,3 +1,7 @@
+# Packaging for lwe-sftp. Installs the lwe_sftp package (with its R-LWE parameter file) and
+# the three console commands: lscp, lsftp and lsftpd, all defined in lwe_sftp/cli.py.
+# tools/ and tests/ are development-only and are not installed.
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"

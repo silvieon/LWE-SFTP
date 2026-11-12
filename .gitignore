@@ -1,7 +1,10 @@
+# Python bytecode
 __pycache__/
 *.pyc
+# build and packaging output
 *.egg-info/
 build/
 dist/
+# local virtualenv and test cache
 .venv/
 .pytest_cache/
